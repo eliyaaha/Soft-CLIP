@@ -1,3 +1,5 @@
 .env
 bas.sh
 /data
+/logs
+/checkpoints
