@@ -38,7 +38,13 @@ def extract_sections(text):
     impression_match = re.search(fr'{impression_pattern}\s*(.*)', text, re.DOTALL | re.IGNORECASE)
 
     findings = findings_match.group(1).strip() if findings_match else ""
-    impression = impression_match.group(1).strip() if impression_match else text
+    
+    # If there is an impression match, use it. Otherwise, if no 'Impression' keyword exists, the whole text might be findings.
+    if impression_match:
+        impression = impression_match.group(1).strip()
+    else:
+        # If 'Impression:' is nowhere to be found, we don't assume the whole text is Impression
+        impression = ""
 
     return findings, impression
 
@@ -130,10 +136,17 @@ def prepare_dataframe(csv_path):
     # Drop the temporary metadata column
     df_flat = df_flat.drop(columns=['image_meta'])
 
-    # Extract clean text sub-sections using the existing extract_sections function
-    df_flat[['findings_clean', 'impression_clean']] = df_flat['text'].apply(
-        lambda x: pd.Series(extract_sections(x))
-    )
+    # --- FIXED SECTION: Safe extraction using list comprehension ---
+    extracted_data = [extract_sections(x) for x in df_flat['text']]
+    df_extracted = pd.DataFrame(extracted_data, columns=['findings_clean', 'impression_clean'], index=df_flat.index)
+    df_flat = pd.concat([df_flat, df_extracted], axis=1)
+
+    # Filter out rows where both sections are empty strings
+    initial_count = len(df_flat)
+    df_flat = df_flat[(df_flat['findings_clean'] != "") | (df_flat['impression_clean'] != "")]
+    dropped_count = initial_count - len(df_flat)
+    print(f"Dropped {dropped_count:,} rows where both Findings and Impression were empty.")
+    # ---------------------------------------------------------------
 
     # Reorder columns to make the dataframe intuitive and organized
     ordered_cols = [
@@ -143,7 +156,7 @@ def prepare_dataframe(csv_path):
     existing_cols = [col for col in ordered_cols if col in df_flat.columns]
     df_flat = df_flat[existing_cols]
 
-    print(f"Processing complete. Total flattened rows: {len(df_flat):,}")
+    print(f"Processing complete. Total flattened rows remaining: {len(df_flat):,}")
     return df_flat
 
 

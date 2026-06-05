@@ -6,45 +6,58 @@ import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Configuration
 BASE_DATA_DIR = "/groups/orentsur_group/work/omertole/mimic_data"
-MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
+MODEL_NAME = "microsoft/BiomedVLP-CXR-BERT-specialized" 
+# MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def safe_literal_eval(val):
-    try: return ast.literal_eval(val)
-    except (ValueError, SyntaxError): return val
+    try:
+        return ast.literal_eval(val)
+    except (ValueError, SyntaxError):
+        return val
 
-def extract_sections(text):
-    if not isinstance(text, str): return ""
-    match = re.search(r'Impression:\s*(.*)', text, re.DOTALL | re.IGNORECASE)
-    return match.group(1).strip() if match else text
+# Reuse the saved preprocessed CSV paths from preprocess.py
+from preprocess import OUTPUT_TRAIN_CSV_PATH, OUTPUT_VAL_CSV_PATH
 
 def prepare_and_embed(csv_path, output_pt_path):
     print(f"\n--- Processing: {os.path.basename(csv_path)} ---")
+    # Read the saved, preprocessed CSV (must be produced by preprocess.py)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Preprocessed file not found: {csv_path}. Run preprocess.py first to generate it."
+        )
+
     df = pd.read_csv(csv_path)
-    
-    # 1. Same logic as notebook (Flattening)
-    df['image'] = df['image'].apply(safe_literal_eval)
-    df['text'] = df['text'].apply(safe_literal_eval)
-    df_flat = df.explode('image').reset_index(drop=True)
-    df_flat['text'] = df_flat['text'].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else x)
-    df_flat['impression_clean'] = df_flat['text'].apply(extract_sections)
-    
-    texts = df_flat['impression_clean'].tolist()
+    if df.empty:
+        print("No data to embed. Exiting.")
+        return
+
+    # Prefer the 'text' column (original text) as requested; fallback to 'impression_clean' if missing
+    if 'text' in df.columns:
+        texts = df['text'].fillna('').astype(str).tolist()
+    elif 'impression_clean' in df.columns:
+        texts = df['impression_clean'].fillna('').astype(str).tolist()
+    else:
+        raise ValueError("Preprocessed CSV does not contain 'text' or 'impression_clean' columns")
     print(f"Total rows to embed: {len(texts):,}")
 
     # 2. Extract Embeddings
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True).to(device)
     model.eval()
     
     dataset = torch.utils.data.TensorDataset(torch.arange(len(texts))) # Just to batch indices
     loader = DataLoader(dataset, batch_size=64, shuffle=False)
     
     all_embeddings = []
-    print("Running BioClinicalBERT inference...")
+    print("Running BiomedVLP-CXR-BERT inference...")
     with torch.no_grad():
         for i in tqdm(range(0, len(texts), 64)):
             batch_texts = texts[i : i + 64]
@@ -68,13 +81,13 @@ def prepare_and_embed(csv_path, output_pt_path):
 if __name__ == "__main__":
     # Process Train
     prepare_and_embed(
-        csv_path=os.path.join(BASE_DATA_DIR, "mimic_cxr_aug_train.csv"),
-        output_pt_path=os.path.join(BASE_DATA_DIR, "train_bioclinicalbert_embeddings.pt")
+        csv_path=OUTPUT_TRAIN_CSV_PATH,
+        output_pt_path=os.path.join(BASE_DATA_DIR, "train_biomedvlp_cxr_bert_embeddings.pt")
     )
-    
+
     # Process Val
     prepare_and_embed(
-        csv_path=os.path.join(BASE_DATA_DIR, "mimic_cxr_aug_validate.csv"),
-        output_pt_path=os.path.join(BASE_DATA_DIR, "val_bioclinicalbert_embeddings.pt")
+        csv_path=OUTPUT_VAL_CSV_PATH,
+        output_pt_path=os.path.join(BASE_DATA_DIR, "val_biomedvlp_cxr_bert_embeddings.pt")
     )
     print("\nDone! Both files are ready for Soft-CLIP training.")
