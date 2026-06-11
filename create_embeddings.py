@@ -1,37 +1,150 @@
+"""Generate precomputed BERT text embeddings for soft-CLIP training.
+
+Pipeline order: run ``preprocess.py`` first; this script reads its outputs.
+
+Examples
+--------
+    # Default: BiomedVLP over the raw `text` column
+    python create_embeddings.py
+
+    # Different model
+    python create_embeddings.py --model bioclinicalbert
+
+    # Different field (impression-only or findings-only ablations)
+    python create_embeddings.py --field impression_clean
+    python create_embeddings.py --field findings_clean
+
+    # Re-generate even if the output already exists
+    python create_embeddings.py --field findings_clean --overwrite
+
+    # Inspect what's already on disk
+    python create_embeddings.py --list
+
+Output naming: ``{split}_{model_slug}_{field}_embeddings.pt`` under BASE_DATA_DIR.
+Each (model, field) combination writes its own files, so different ablations
+accumulate side-by-side and existing files are never silently overwritten.
+"""
+
+import argparse
+import glob
 import os
-import ast
-import re
-import torch
+
 import pandas as pd
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, AutoModel
-from tqdm import tqdm
+import torch
 from dotenv import load_dotenv
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer
+
+from preprocess import (
+    BASE_DATA_DIR,
+    OUTPUT_TRAIN_CSV_PATH,
+    OUTPUT_VAL_CSV_PATH,
+)
 
 load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Configuration
-BASE_DATA_DIR = "/groups/orentsur_group/work/omertole/mimic_data"
-MODEL_NAME = "microsoft/BiomedVLP-CXR-BERT-specialized" 
-# MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODELS = {
+    "biomedvlp": "microsoft/BiomedVLP-CXR-BERT-specialized",
+    "bioclinicalbert": "emilyalsentzer/Bio_ClinicalBERT",
+}
 
-def safe_literal_eval(val):
-    try:
-        return ast.literal_eval(val)
-    except (ValueError, SyntaxError):
-        return val
+SUPPORTED_FIELDS = ("text", "findings_clean", "impression_clean")
+DEFAULT_FIELD = "text"
+DEFAULT_MODEL = "biomedvlp"
 
-# Reuse the saved preprocessed CSV paths from preprocess.py
-from preprocess import OUTPUT_TRAIN_CSV_PATH, OUTPUT_VAL_CSV_PATH
 
-def prepare_and_embed(csv_path, output_pt_path):
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Embed processed CSV text with a BERT-family model.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        choices=sorted(MODELS.keys()),
+        default=DEFAULT_MODEL,
+        help="Which BERT model to use for text embedding.",
+    )
+    parser.add_argument(
+        "--field",
+        choices=SUPPORTED_FIELDS,
+        default=DEFAULT_FIELD,
+        help="Which text column from the processed CSV to embed.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Tokenizer/inference batch size.",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=128,
+        help="Tokenizer max sequence length.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Recompute and overwrite the output .pt file if it already exists.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List existing *_embeddings.pt files in BASE_DATA_DIR and exit.",
+    )
+    return parser.parse_args()
+
+
+def _list_existing_embeddings() -> None:
+    pattern = os.path.join(BASE_DATA_DIR, "*_embeddings.pt")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        print(f"No embedding files found under {BASE_DATA_DIR}")
+        return
+    print(f"Existing embedding files in {BASE_DATA_DIR}:")
+    for path in files:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"  {os.path.basename(path)}  ({size_mb:.1f} MB)")
+
+
+def _output_path(split: str, model_slug: str, field: str) -> str:
+    return os.path.join(BASE_DATA_DIR, f"{split}_{model_slug}_{field}_embeddings.pt")
+
+
+def _resolve_text_column(df: pd.DataFrame, field: str) -> pd.Series:
+    if field not in df.columns:
+        available = [c for c in df.columns if c in SUPPORTED_FIELDS]
+        raise ValueError(
+            f"Field {field!r} not found in processed CSV. "
+            f"Available supported fields: {available}"
+        )
+    return df[field].fillna("").astype(str)
+
+
+def prepare_and_embed(
+    csv_path: str,
+    output_pt_path: str,
+    *,
+    model_hf_id: str,
+    field: str,
+    batch_size: int,
+    max_length: int,
+    overwrite: bool,
+    device: torch.device,
+) -> None:
     print(f"\n--- Processing: {os.path.basename(csv_path)} ---")
-    # Read the saved, preprocessed CSV (must be produced by preprocess.py)
+
+    if os.path.exists(output_pt_path) and not overwrite:
+        print(
+            f"Output already exists, skipping: {output_pt_path}\n"
+            f"(pass --overwrite to regenerate)"
+        )
+        return
+
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
-            f"Preprocessed file not found: {csv_path}. Run preprocess.py first to generate it."
+            f"Preprocessed file not found: {csv_path}. "
+            f"Run `python preprocess.py` first."
         )
 
     df = pd.read_csv(csv_path)
@@ -39,55 +152,71 @@ def prepare_and_embed(csv_path, output_pt_path):
         print("No data to embed. Exiting.")
         return
 
-    # Prefer the 'text' column (original text) as requested; fallback to 'impression_clean' if missing
-    if 'text' in df.columns:
-        texts = df['text'].fillna('').astype(str).tolist()
-    elif 'impression_clean' in df.columns:
-        texts = df['impression_clean'].fillna('').astype(str).tolist()
-    else:
-        raise ValueError("Preprocessed CSV does not contain 'text' or 'impression_clean' columns")
-    print(f"Total rows to embed: {len(texts):,}")
+    texts = _resolve_text_column(df, field).tolist()
+    print(f"Embedding column {field!r}  |  rows: {len(texts):,}")
 
-    # 2. Extract Embeddings
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_hf_id, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_hf_id, trust_remote_code=True).to(device)
     model.eval()
-    
-    dataset = torch.utils.data.TensorDataset(torch.arange(len(texts))) # Just to batch indices
-    loader = DataLoader(dataset, batch_size=64, shuffle=False)
-    
+
     all_embeddings = []
-    print("Running BiomedVLP-CXR-BERT inference...")
+    print(f"Running {model_hf_id} inference...")
     with torch.no_grad():
-        for i in tqdm(range(0, len(texts), 64)):
-            batch_texts = texts[i : i + 64]
+        for i in tqdm(range(0, len(texts), batch_size)):
+            batch_texts = texts[i : i + batch_size]
             inputs = tokenizer(
-                batch_texts, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
-                max_length=128
+                batch_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
             ).to(device)
-            
+
             outputs = model(**inputs)
-            embeddings = outputs.last_hidden_state[:, 0, :] # CLS token
+            embeddings = outputs.last_hidden_state[:, 0, :]  # CLS token
             embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
             all_embeddings.append(embeddings.cpu())
-            
+
     final_embeddings = torch.cat(all_embeddings, dim=0)
+    os.makedirs(os.path.dirname(output_pt_path), exist_ok=True)
     torch.save(final_embeddings, output_pt_path)
     print(f"Saved {final_embeddings.shape[0]} embeddings to: {output_pt_path}")
 
-if __name__ == "__main__":
-    # Process Train
-    prepare_and_embed(
-        csv_path=OUTPUT_TRAIN_CSV_PATH,
-        output_pt_path=os.path.join(BASE_DATA_DIR, "train_biomedvlp_cxr_bert_embeddings.pt")
+
+def main() -> None:
+    args = parse_args()
+
+    if args.list:
+        _list_existing_embeddings()
+        return
+
+    model_slug = args.model
+    model_hf_id = MODELS[model_slug]
+    field = args.field
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Model : {model_slug}  ({model_hf_id})")
+    print(f"Field : {field}")
+    print(f"Tag   : {model_slug}_{field}")
+    print(f"Device: {device}")
+
+    for split, csv_path in (("train", OUTPUT_TRAIN_CSV_PATH), ("val", OUTPUT_VAL_CSV_PATH)):
+        prepare_and_embed(
+            csv_path=csv_path,
+            output_pt_path=_output_path(split, model_slug, field),
+            model_hf_id=model_hf_id,
+            field=field,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            overwrite=args.overwrite,
+            device=device,
+        )
+
+    print(
+        f"\nDone. Use --embeddings-tag {model_slug}_{field} "
+        f"in train_soft_clip.py to consume these files."
     )
 
-    # Process Val
-    prepare_and_embed(
-        csv_path=OUTPUT_VAL_CSV_PATH,
-        output_pt_path=os.path.join(BASE_DATA_DIR, "val_biomedvlp_cxr_bert_embeddings.pt")
-    )
-    print("\nDone! Both files are ready for Soft-CLIP training.")
+
+if __name__ == "__main__":
+    main()
