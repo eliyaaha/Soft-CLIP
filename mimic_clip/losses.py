@@ -209,11 +209,6 @@ def soft_clip_hybrid_loss(
             dim=1,
         )
 
-    soft_targets_dist = F.softmax(
-        semantic_sim / soft_temp,
-        dim=1,
-    )
-
     soft_loss = (
         F.kl_div(log_preds_img, soft_targets_dist, reduction="batchmean")
         + F.kl_div(log_preds_txt, soft_targets_dist.t(), reduction="batchmean")
