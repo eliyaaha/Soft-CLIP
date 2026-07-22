@@ -53,32 +53,42 @@ def _top_k_row_mask(matrix: torch.Tensor, k: int) -> torch.Tensor:
     mask.scatter_(1, topk_idx, 1.0)
     return matrix.masked_fill(mask == 0, float("-inf"))
 
-def _threshold_row_mask(
-    matrix: torch.Tensor,
+def _threshold_soft_targets(
+    similarity_matrix: torch.Tensor,
     threshold: float,
 ) -> torch.Tensor:
-    """Mask entries below the threshold and preserve the diagonal."""
-    if not -1.0 <= threshold <= 1.0:
+    """Create threshold-based soft targets as defined in the paper."""
+    if not -1.0 <= threshold < 1.0:
         raise ValueError(
-            "soft_threshold must be between -1 and 1. "
+            "soft_threshold must be in [-1, 1). "
             f"Received {threshold}."
         )
 
-    keep_mask = matrix >= threshold
+    keep_mask = similarity_matrix > threshold
 
-    # Ensure that every sample retains its original paired target.
+    # Always preserve the paired sample.
     diagonal_mask = torch.eye(
-        matrix.size(0),
-        matrix.size(1),
+        similarity_matrix.size(0),
+        similarity_matrix.size(1),
         dtype=torch.bool,
-        device=matrix.device,
+        device=similarity_matrix.device,
     )
     keep_mask = keep_mask | diagonal_mask
 
-    return matrix.masked_fill(
-        ~keep_mask,
-        float("-inf"),
+    targets = torch.where(
+        keep_mask,
+        (similarity_matrix - threshold) / (1.0 - threshold),
+        torch.zeros_like(similarity_matrix),
     )
+
+    targets = targets.clamp_min(0.0)
+
+    row_sums = targets.sum(
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1e-12)
+
+    return targets / row_sums
 
 
 def _combined_text_image_similarity(
@@ -168,27 +178,21 @@ def soft_clip_hybrid_loss(
 
     # 3. Soft target calculation
 
-    if soft_top_k is not None and soft_threshold is not None:
-        raise ValueError(
-            "soft_top_k and soft_threshold cannot be used together."
-        )
-
     if soft_threshold is not None:
-        # New behavior:
-        # threshold is applied to combined cosine similarities.
-        semantic_sim = _combined_text_image_similarity(
+        combined_similarity = _combined_text_image_similarity(
             image_features=image_features,
             batch_semantic_embeddings=batch_semantic_embeddings,
             text_similarity_weight=text_similarity_weight,
         )
 
-        semantic_sim = _threshold_row_mask(
-            matrix=semantic_sim,
+        # threshold -> rescale -> row-normalize.
+        soft_targets_dist = _threshold_soft_targets(
+            similarity_matrix=combined_similarity,
             threshold=soft_threshold,
         )
 
     else:
-        # Original behavior, intentionally unchanged.
+        # Original behavior remains unchanged.
         semantic_sim = torch.matmul(
             batch_semantic_embeddings,
             batch_semantic_embeddings.t(),
@@ -199,6 +203,11 @@ def soft_clip_hybrid_loss(
                 semantic_sim,
                 soft_top_k,
             )
+
+        soft_targets_dist = F.softmax(
+            semantic_sim / soft_temp,
+            dim=1,
+        )
 
     soft_targets_dist = F.softmax(
         semantic_sim / soft_temp,
