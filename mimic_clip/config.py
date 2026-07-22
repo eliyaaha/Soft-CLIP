@@ -54,6 +54,8 @@ class ExperimentConfig:
     alpha: float = 0.5
     soft_temp: float = 0.1
     soft_top_k: Optional[int] = None
+    soft_threshold: Optional[float] = None
+    text_similarity_weight: float = 0.5
     embeddings_tag: Optional[str] = None
     train_embeddings_path: Optional[str] = None
     val_embeddings_path: Optional[str] = None
@@ -94,6 +96,9 @@ class ExperimentConfig:
             parts.append(f"t{self.soft_temp}")
             if self.soft_top_k is not None:
                 parts.append(f"k{self.soft_top_k}")
+            if self.soft_threshold is not None:
+                parts.append(f"thr{self.soft_threshold}")
+                parts.append(f"tw{self.text_similarity_weight}")
         self.run_name = "_".join(str(p) for p in parts)
 
     def resolve_checkpoint_dir(self) -> None:
@@ -108,6 +113,23 @@ class ExperimentConfig:
             raise ValueError(
                 f"text_field={self.text_field!r} not in {ALLOWED_TEXT_FIELDS}"
             )
+
+        if self.soft_top_k is not None and self.soft_threshold is not None:
+            raise ValueError(
+                "soft_top_k and soft_threshold cannot be used together."
+            )
+
+        if self.soft_threshold is not None:
+            if not -1.0 <= self.soft_threshold <= 1.0:
+                raise ValueError(
+                    "soft_threshold must be between -1 and 1."
+                )
+
+        if not 0.0 <= self.text_similarity_weight <= 1.0:
+            raise ValueError(
+                "text_similarity_weight must be between 0 and 1."
+            )
+
         self.resolve_embeddings_paths()
         self.resolve_run_name()
         self.resolve_checkpoint_dir()
@@ -128,6 +150,8 @@ class ExperimentConfig:
                 f"  alpha           : {self.alpha}",
                 f"  soft_temp       : {self.soft_temp}",
                 f"  soft_top_k      : {self.soft_top_k}",
+                f"  soft_threshold         : {self.soft_threshold}",
+                f"  text_similarity_weight : {self.text_similarity_weight}",
                 f"  embeddings_tag  : {self.embeddings_tag}",
                 f"  train embeds    : {self.train_embeddings_path}",
                 f"  val embeds      : {self.val_embeddings_path}",

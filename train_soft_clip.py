@@ -85,7 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-top-k", type=int, default=None,
                         help="Keep only the top-K neighbors per row in the soft targets "
                              "(None = full row).")
+    parser.add_argument("--soft-threshold", type=float,default=None,
+                        help="Keep samples whose combined text-image similarity is at least this value.")
 
+    parser.add_argument("--text-similarity-weight", type=float, default=0.5,
+                        help="Weight of text similarity in threshold mode. Image similarity receives 1 minus this value.")
+    
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=0.2)
@@ -109,6 +114,8 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         alpha=args.alpha,
         soft_temp=args.soft_temp,
         soft_top_k=args.soft_top_k,
+        soft_threshold=args.soft_threshold,
+        text_similarity_weight=args.text_similarity_weight,
         embeddings_tag=args.embeddings_tag,
         train_embeddings_path=args.train_embeddings,
         val_embeddings_path=args.val_embeddings,
@@ -141,6 +148,8 @@ def make_soft_loss_fn(
             alpha=config.alpha,
             soft_temp=config.soft_temp,
             soft_top_k=config.soft_top_k,
+            soft_threshold=config.soft_threshold,
+            text_similarity_weight=config.text_similarity_weight,
         )
     return loss_fn
 
