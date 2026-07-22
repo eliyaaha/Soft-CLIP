@@ -9,6 +9,7 @@ Examples
 
     # Different model
     python create_embeddings.py --model bioclinicalbert
+    python create_embeddings.py --model gemma_embed
 
     # Different field (impression-only or findings-only ablations)
     python create_embeddings.py --field impression_clean
@@ -34,6 +35,7 @@ import torch
 from dotenv import load_dotenv
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
+from sentence_transformers import SentenceTransformer
 
 from preprocess import (
     BASE_DATA_DIR,
@@ -46,6 +48,7 @@ load_dotenv()
 MODELS = {
     "biomedvlp": "microsoft/BiomedVLP-CXR-BERT-specialized",
     "bioclinicalbert": "emilyalsentzer/Bio_ClinicalBERT",
+    "gemma_embed": "google/embeddinggemma-300m",
 }
 
 SUPPORTED_FIELDS = ("text", "findings_clean", "impression_clean")
@@ -55,14 +58,14 @@ DEFAULT_MODEL = "biomedvlp"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Embed processed CSV text with a BERT-family model.",
+        description="Embed processed CSV text with a BERT/Gemma-family model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--model",
         choices=sorted(MODELS.keys()),
         default=DEFAULT_MODEL,
-        help="Which BERT model to use for text embedding.",
+        help="Which model to use for text embedding.",
     )
     parser.add_argument(
         "--field",
@@ -125,6 +128,7 @@ def prepare_and_embed(
     csv_path: str,
     output_pt_path: str,
     *,
+    model_slug: str,
     model_hf_id: str,
     field: str,
     batch_size: int,
@@ -155,29 +159,52 @@ def prepare_and_embed(
     texts = _resolve_text_column(df, field).tolist()
     print(f"Embedding column {field!r}  |  rows: {len(texts):,}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_hf_id, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_hf_id, trust_remote_code=True).to(device)
-    model.eval()
+    # Branching logic based on the model framework needed
+    if model_slug == "gemma_embed":
+        print(f"Loading SentenceTransformer: {model_hf_id}...")
+        hf_token = os.getenv("HF_TOKEN")
+        model = SentenceTransformer(model_hf_id, device=str(device), token=hf_token)
+        
+        # Set max_length directly on the model instance
+        model.max_seq_length = max_length
+        
+        print(f"Running {model_hf_id} inference...")
+        # encode_document automatically handles tokenization, left-padding,
+        # causal pooling, and normalization internally.
+        embeddings_np = model.encode_document(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True
+        )
+        final_embeddings = torch.from_numpy(embeddings_np)
+        
+    else:
+        # Standard workflow for BERT/Encoder-only Hugging Face models
+        tokenizer = AutoTokenizer.from_pretrained(model_hf_id, trust_remote_code=True)
+        model = AutoModel.from_pretrained(model_hf_id, trust_remote_code=True).to(device)
+        model.eval()
 
-    all_embeddings = []
-    print(f"Running {model_hf_id} inference...")
-    with torch.no_grad():
-        for i in tqdm(range(0, len(texts), batch_size)):
-            batch_texts = texts[i : i + batch_size]
-            inputs = tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-            ).to(device)
+        all_embeddings = []
+        print(f"Running {model_hf_id} inference...")
+        with torch.no_grad():
+            for i in tqdm(range(0, len(texts), batch_size)):
+                batch_texts = texts[i : i + batch_size]
+                inputs = tokenizer(
+                    batch_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                ).to(device)
 
-            outputs = model(**inputs)
-            embeddings = outputs.last_hidden_state[:, 0, :]  # CLS token
-            embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
-            all_embeddings.append(embeddings.cpu())
+                outputs = model(**inputs)
+                embeddings = outputs.last_hidden_state[:, 0, :]  # CLS token
+                embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
+                all_embeddings.append(embeddings.cpu())
 
-    final_embeddings = torch.cat(all_embeddings, dim=0)
+        final_embeddings = torch.cat(all_embeddings, dim=0)
+
     os.makedirs(os.path.dirname(output_pt_path), exist_ok=True)
     torch.save(final_embeddings, output_pt_path)
     print(f"Saved {final_embeddings.shape[0]} embeddings to: {output_pt_path}")
@@ -204,6 +231,7 @@ def main() -> None:
         prepare_and_embed(
             csv_path=csv_path,
             output_pt_path=_output_path(split, model_slug, field),
+            model_slug=model_slug,
             model_hf_id=model_hf_id,
             field=field,
             batch_size=args.batch_size,
