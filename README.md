@@ -60,16 +60,13 @@ Outputs: `mimic_cxr_processed_train.csv`, `mimic_cxr_processed_validate.csv`.
 
 ## 2. Text embeddings — `create_embeddings.py`
 
-Tokenizes the chosen text column with a BERT-family model and saves
-L2-normalized CLS embeddings as a `.pt` tensor. **Each (model, field)
+Embeds the chosen text column with a BERT-family or Gemma-family model and
+saves normalized embeddings as a `.pt` tensor. **Each (model, field)
 combination writes its own file** — nothing is overwritten silently, so you
 can build a library of embeddings for soft-CLIP ablations.
 
 ```bash
-python create_embeddings.py [--model {biomedvlp,bioclinicalbert}]
-                             [--field {text,findings_clean,impression_clean}]
-                             [--batch-size N] [--max-length N]
-                             [--overwrite] [--list]
+python create_embeddings.py [--model {biomedvlp,bioclinicalbert,gemma_embed}]
 ```
 
 Flag | Default | Notes
