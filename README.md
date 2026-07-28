@@ -72,14 +72,16 @@ python create_embeddings.py [--model {biomedvlp,bioclinicalbert}]
                              [--overwrite] [--list]
 ```
 
-| Flag | Default | Notes |
-|------|---------|-------|
-| `--model` | `biomedvlp` | `biomedvlp` → `microsoft/BiomedVLP-CXR-BERT-specialized`; `bioclinicalbert` → `emilyalsentzer/Bio_ClinicalBERT` |
-| `--field` | `text` | Raw report text. Other options embed just the findings or impression section. |
-| `--batch-size` | `64` | Tokenizer/forward batch. |
-| `--max-length` | `128` | Tokenizer truncation length. |
-| `--overwrite` | off | Recompute even if the output `.pt` exists. |
-| `--list` | off | Print existing `*_embeddings.pt` files under `BASE_DATA_DIR` and exit. |
+Flag | Default | Notes
+---|---|---
+`--model` | `biomedvlp` | `biomedvlp` → `microsoft/BiomedVLP-CXR-BERT-specialized`; `bioclinicalbert` → `emilyalsentzer/Bio_ClinicalBERT`; `gemma_embed` → `google/embeddinggemma-300m` (general-purpose embedding model, no clinical fine-tuning)
+`--field` | `text` | Raw report text. Other options embed just the findings or impression section.
+`--batch-size` | `64` | Tokenizer/forward batch.
+`--max-length` | `128` | Tokenizer/sequence truncation length.
+`--overwrite` | off | Recompute even if the output `.pt` exists.
+`--list` | off | Print existing `*_embeddings.pt` files under `BASE_DATA_DIR` and exit.
+
+> `gemma_embed` uses `sentence-transformers`'s `encode_document`, which handles tokenization, left-padding, causal pooling, and normalization internally — a different code path from the CLS-token pooling used for the two BERT models. Requires the `sentence-transformers` package, and an `HF_TOKEN` in `.env` if the model is gated on Hugging Face.
 
 Output file names:
 
@@ -102,6 +104,9 @@ python create_embeddings.py --field findings_clean
 
 # Compare BERT models
 python create_embeddings.py --model bioclinicalbert --field impression_clean
+
+# Gemma embeddings (general-purpose, no clinical fine-tuning)
+python create_embeddings.py --model gemma_embed --field text
 
 # List what you already have
 python create_embeddings.py --list
@@ -155,31 +160,37 @@ precomputed BERT similarities. **The choice of embeddings is independent
 of the CLIP training hyperparameters**, so you can compare embedding
 sources without re-embedding or re-training in lock-step.
 
+Two mutually exclusive pseudo-positive selection strategies are available: a **fixed top-K** (`--soft-top-k`), and a **similarity threshold** (`--soft-threshold`) where the number of retained neighbors varies per row based on local similarity density. If `--soft-threshold` is set, `--soft-top-k` is ignored.
+
 ```bash
 python train_soft_clip.py [--mode {train,eval,both}] [--checkpoint PATH]
                            [--text-field {text,findings_clean,impression_clean}]
                            [--embeddings-tag TAG]
                            [--train-embeddings PATH] [--val-embeddings PATH]
-                           [--alpha A] [--soft-temp T] [--soft-top-k K]
+                           [--alpha A] [--soft-temp T]
+                           [--soft-top-k K]
+                           [--soft-threshold TAU] [--text-similarity-weight W]
                            [--batch-size N] [--lr LR] [--weight-decay WD]
                            [--epochs N] [--patience N] [--num-workers N]
                            [--run-name NAME]
 ```
 
-| Flag | Default | Notes |
-|------|---------|-------|
-| `--mode` | `both` | |
-| `--checkpoint` | – | Required for `--mode eval`. |
-| `--text-field` | `text` | Text column CLIP itself sees. |
-| `--embeddings-tag` | `biomedvlp_text` | Looks up `{train,val}_{tag}_embeddings.pt` under `BASE_DATA_DIR`. |
-| `--train-embeddings`, `--val-embeddings` | – | Override the tag with explicit paths. |
-| `--alpha` | `0.5` | Soft-loss weight; `(1 - alpha)` weights the hard term. |
-| `--soft-temp` | `0.1` | Temperature for softmax over semantic similarities. |
-| `--soft-top-k` | `None` | If set, only the K largest similarities per row form the soft target distribution (K-neighbor ablation). |
-| `--batch-size` | `128` | |
-| `--lr` | `1e-6` | |
-| `--epochs` / `--patience` | `10` / `2` | |
-| `--run-name` | auto | Auto name encodes `loss_field_tag_alpha_temp[_k]`. |
+Flag | Default | Notes
+---|---|---
+`--mode` | `both` |
+`--checkpoint` | – | Required for `--mode eval`.
+`--text-field` | `text` | Text column CLIP itself sees.
+`--embeddings-tag` | `biomedvlp_text` | Looks up `{train,val}_{tag}_embeddings.pt` under `BASE_DATA_DIR`.
+`--train-embeddings`, `--val-embeddings` | – | Override the tag with explicit paths.
+`--alpha` | `0.5` | Soft-loss weight; `(1 - alpha)` weights the hard term.
+`--soft-temp` | `0.1` | Temperature for softmax over semantic similarities (top-K mode only).
+`--soft-top-k` | `None` | If set, only the K largest similarities per row form the soft target distribution (fixed-K neighbor ablation). Ignored if `--soft-threshold` is set.
+`--soft-threshold` | `None` | If set, keeps only pairs whose combined similarity exceeds this value, rescales as `(s - threshold)/(1 - threshold)`, and row-normalizes — a data-dependent (dynamic-K) alternative to `--soft-top-k`. Must be in `[-1, 1)`.
+`--text-similarity-weight` | `0.5` | Only used in threshold mode. Weight on text similarity when combining it with image similarity: `combined = w * text_sim + (1-w) * image_sim`. Set to `1.0` to threshold on text similarity alone.
+`--batch-size` | `128` |
+`--lr` | `1e-6` |
+`--epochs` / `--patience` | `10` / `2` |
+`--run-name` | auto | Auto name encodes `loss_field_tag_alpha_temp[_k]`.
 
 Startup validates that the resolved CSV and `.pt` files exist; missing files
 raise `FileNotFoundError` with the exact command to run.
@@ -197,11 +208,18 @@ python train_soft_clip.py --mode train --embeddings-tag biomedvlp_text \
     --run-name soft_biomedvlp_text
 python train_soft_clip.py --mode train --embeddings-tag bioclinicalbert_text \
     --run-name soft_bioclin_text
+python train_soft_clip.py --mode train --embeddings-tag gemma_embed_text \
+    --run-name soft_gemma_text
 
-# K-neighbor ablation
+# K-neighbor ablation (fixed top-K)
 python train_soft_clip.py --mode train --embeddings-tag biomedvlp_text \
     --alpha 0.3 --soft-top-k 5 --soft-temp 0.1 \
     --run-name soft_biomedvlp_a03_k5
+ 
+# Threshold-based pseudo-positive selection (dynamic K), text-only similarity
+python train_soft_clip.py --mode train --embeddings-tag biomedvlp_text \
+    --soft-threshold 0.83 --text-similarity-weight 1.0 \
+    --run-name soft_biomedvlp_thresh083
 
 # Custom paths (e.g. embeddings in a different directory)
 python train_soft_clip.py --mode train \
@@ -237,11 +255,13 @@ python create_embeddings.py --model biomedvlp        --field text
 python create_embeddings.py --model biomedvlp        --field findings_clean
 python create_embeddings.py --model biomedvlp        --field impression_clean
 python create_embeddings.py --model bioclinicalbert  --field text
+python create_embeddings.py --model gemma_embed      --field text
 
 # Step 3 — train soft-CLIP with each, holding loss params fixed
 python train_soft_clip.py --mode train --embeddings-tag biomedvlp_text         --run-name cmp_biomedvlp_text
 python train_soft_clip.py --mode train --embeddings-tag biomedvlp_findings_clean --run-name cmp_biomedvlp_find
 python train_soft_clip.py --mode train --embeddings-tag bioclinicalbert_text   --run-name cmp_bioclin_text
+python train_soft_clip.py --mode train --embeddings-tag gemma_embed_text        --run-name cmp_gemma_text
 
 # Step 4 — re-eval anytime
 python train_soft_clip.py --mode eval --checkpoint checkpoints/soft/cmp_biomedvlp_text
@@ -258,12 +278,20 @@ for ALPHA in 0.3 0.5 0.7; do
         --run-name soft_a${ALPHA}_k${K}
   done
 done
+
+# Threshold sweep
+for TAU in 0.74 0.83 0.89; do
+  python train_soft_clip.py --mode train \
+      --embeddings-tag biomedvlp_text \
+      --soft-threshold $TAU --text-similarity-weight 1.0 \
+      --run-name soft_thresh${TAU}
+done
 ```
 
 ## Paths and environment
 
-- `BASE_DATA_DIR` is defined in `preprocess.py` and reused everywhere via
-  `mimic_clip.config`. Override it there if your data lives elsewhere.
-- `IMAGE_DIR` and the processed CSV paths derive from `BASE_DATA_DIR`.
-- `HF_TOKEN` is read from `.env` (used by `create_embeddings.py`).
-- Checkpoints land under `./checkpoints/{hard|soft}/{run_name}/`.
+* `BASE_DATA_DIR` is defined in `preprocess.py` and reused everywhere via `mimic_clip.config`. Override it there if your data lives elsewhere.
+* `IMAGE_DIR` and the processed CSV paths derive from `BASE_DATA_DIR`.
+* `HF_TOKEN` is read from `.env` (used by `create_embeddings.py`, required for gated Hugging Face models).
+* `sentence-transformers` is required for `--model gemma_embed` in `create_embeddings.py`.
+* Checkpoints land under `./checkpoints/{hard|soft}/{run_name}/`.
