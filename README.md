@@ -2,14 +2,14 @@
 
 Fine-tune CLIP on MIMIC-CXR with two training objectives — a hard study-level
 contrastive loss and a soft KL-supervised hybrid loss — and run ablations
-over text fields, BERT embedding models, and soft-loss hyperparameters.
+over text fields, embedding models, and soft-loss hyperparameters.
 
 ## Repo layout
 
 ```
 .
 ├── preprocess.py            # raw MIMIC CSVs → processed CSVs   (step 1)
-├── create_embeddings.py     # processed CSVs → BERT .pt files   (step 2)
+├── create_embeddings.py     # processed CSVs → embedding .pt files   (step 2)
 ├── train_baseline.py        # hard CLIP fine-tuning             (step 3a)
 ├── train_soft_clip.py       # soft-CLIP fine-tuning             (step 3b)
 └── mimic_clip/              # shared library used by both train scripts
@@ -67,6 +67,9 @@ can build a library of embeddings for soft-CLIP ablations.
 
 ```bash
 python create_embeddings.py [--model {biomedvlp,bioclinicalbert,gemma_embed}]
+                             [--field {text,findings_clean,impression_clean}]
+                             [--batch-size N] [--max-length N]
+                             [--overwrite] [--list]
 ```
 
 Flag | Default | Notes
@@ -153,7 +156,7 @@ python train_baseline.py --mode eval --checkpoint checkpoints/hard/hard_impressi
 ## 3b. Soft-CLIP — `train_soft_clip.py`
 
 Hybrid loss: hard diagonal cross-entropy + soft KL targets built from
-precomputed BERT similarities. **The choice of embeddings is independent
+precomputed similarities. **The choice of embeddings is independent
 of the CLIP training hyperparameters**, so you can compare embedding
 sources without re-embedding or re-training in lock-step.
 
