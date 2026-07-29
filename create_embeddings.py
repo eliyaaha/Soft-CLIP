@@ -122,6 +122,18 @@ def parse_args() -> argparse.Namespace:
         help="Recompute and overwrite the output .pt file if it already exists.",
     )
     parser.add_argument(
+        "--splits",
+        nargs="+",
+        choices=("train", "val"),
+        default=["train", "val"],
+        help=(
+            "Which splits to embed. Use `--splits val` when screening many "
+            "variants with compare_embeddings.py: the intrinsic comparison only "
+            "needs val (~3k rows vs ~350k), so the whole grid costs minutes "
+            "instead of hours. Generate train embeddings only for the winner."
+        ),
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List existing *_embeddings.pt files in BASE_DATA_DIR and exit.",
@@ -264,7 +276,32 @@ def _embed_report_by_sentence(
 
 
 def _default_pooling(model_slug: str) -> str:
+    if model_slug == "gemma_embed":
+        # SentenceTransformer.encode_document pools internally; --pooling has no
+        # effect. Label it "native" so the tag never claims a pooling that was
+        # not applied.
+        return "native"
     return "projection" if model_slug == "biomedvlp" else "mean"
+
+
+def _resolve_pooling(model_slug: str, requested: str) -> str:
+    """Resolve the pooling label, honouring what each model can actually do.
+
+    ``gemma_embed`` goes through SentenceTransformer.encode_document, which does
+    its own tokenisation and pooling internally -- no pooling option applies. It
+    is labelled ``native`` so the tag never claims a strategy that was not used.
+    """
+    if model_slug == "gemma_embed":
+        return "native"
+    if requested == "auto":
+        return _default_pooling(model_slug)
+    if requested == "projection" and model_slug != "biomedvlp":
+        raise ValueError(
+            f"--pooling projection is only available for biomedvlp "
+            f"(CXR-BERT's projection head); {model_slug} has no such head. "
+            f"Use --pooling mean for a matched cross-model comparison."
+        )
+    return requested
 
 
 def _resolve_text_column(df: pd.DataFrame, field: str) -> pd.Series:
@@ -410,9 +447,8 @@ def main() -> None:
     field = args.field
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    pooling = args.pooling
-    if pooling == "auto":
-        pooling = _default_pooling(model_slug)
+    pooling = _resolve_pooling(model_slug, args.pooling)
+    if args.pooling == "auto" and model_slug != "gemma_embed":
         print(
             f"\n!! --pooling auto resolved to {pooling!r} for {model_slug}.\n"
             f"   'auto' picks each model's NATIVE representation, which differs "
@@ -440,7 +476,9 @@ def main() -> None:
             "--overwrite if you are regenerating an existing tag."
         )
 
-    for split, csv_path in (("train", OUTPUT_TRAIN_CSV_PATH), ("val", OUTPUT_VAL_CSV_PATH)):
+    split_paths = {"train": OUTPUT_TRAIN_CSV_PATH, "val": OUTPUT_VAL_CSV_PATH}
+    for split in args.splits:
+        csv_path = split_paths[split]
         prepare_and_embed(
             csv_path=csv_path,
             output_pt_path=_output_path(split, tag),
