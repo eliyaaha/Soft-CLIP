@@ -76,12 +76,52 @@ Flag | Default | Notes
 ---|---|---
 `--model` | `biomedvlp` | `biomedvlp` → `microsoft/BiomedVLP-CXR-BERT-specialized`; `bioclinicalbert` → `emilyalsentzer/Bio_ClinicalBERT`; `gemma_embed` → `google/embeddinggemma-300m` (general-purpose embedding model, no clinical fine-tuning)
 `--field` | `text` | Raw report text. Other options embed just the findings or impression section.
+`--pooling` | `auto` | `auto` = `projection` for biomedvlp, `mean` otherwise. `cls` reproduces the original (incorrect) behaviour for comparison. Ignored for `gemma_embed`.
+`--sentence-level` | off | Embed each sentence separately and average, instead of truncating the whole report. Recommended for `--field text`.
+`--tag-suffix` | `""` | Appended to output filenames, so pooling variants can sit side by side.
 `--batch-size` | `64` | Tokenizer/forward batch.
 `--max-length` | `128` | Tokenizer/sequence truncation length.
 `--overwrite` | off | Recompute even if the output `.pt` exists.
 `--list` | off | Print existing `*_embeddings.pt` files under `BASE_DATA_DIR` and exit.
 
-> `gemma_embed` uses `sentence-transformers`'s `encode_document`, which handles tokenization, left-padding, causal pooling, and normalization internally — a different code path from the CLS-token pooling used for the two BERT models. Requires the `sentence-transformers` package, and an `HF_TOKEN` in `.env` if the model is gated on Hugging Face.
+> `gemma_embed` uses `sentence-transformers`'s `encode_document`, which handles tokenization, left-padding, causal pooling, and normalization internally — a different code path from the two BERT models. Requires the `sentence-transformers` package, and an `HF_TOKEN` in `.env` if the model is gated on Hugging Face.
+
+> **Pooling matters more than the model choice.** Raw `last_hidden_state[:, 0, :]`
+> is the wrong representation for both BERT encoders: CXR-BERT ships a projection
+> head trained specifically to make CLS embeddings comparable, and
+> Bio_ClinicalBERT has no sentence-level objective at all — its CLS vector is
+> anisotropic, so every pair lands in a narrow similarity band regardless of
+> content. **Any `.pt` file generated before this change used raw CLS; regenerate
+> with `--overwrite`.**
+>
+> Afterwards run `analyze_similarity_threshold.py --tag <tag>` and look at the
+> histogram. A working clinical signal on MIMIC-CXR is **bimodal** — a dense
+> cluster of near-identical normal studies plus a long tail of distinct pathology.
+> A wide unimodal blob means the soft targets built from these embeddings are
+> close to noise, and no amount of `--alpha` tuning will fix that.
+
+> **Pooling is part of the filename, on purpose.** Tags are
+> `{model}_{field}_{pooling}[_sent]`. `--pooling auto` picks each model's *native*
+> representation (`projection` for CXR-BERT, `mean` for Bio_ClinicalBERT), which
+> answers "which pipeline works best" — but it **confounds a model-vs-model
+> comparison**, because pooling varies alongside the model. For a controlled
+> comparison, pass the same `--pooling` to every model. Encoding it in the tag
+> means you cannot accidentally compare across pooling without seeing it.
+
+> **CXR-BERT is a sentence encoder.** Its model card documents it for "radiological
+> sentence embeddings", and its reported inputs average ~58 tokens. A full
+> findings+impression report is well outside that regime and gets silently
+> truncated at `--max-length`. `--sentence-level` embeds each sentence inside the
+> length the encoder was trained for and averages, covering the whole report.
+> Worth generating both and comparing histograms:
+>
+> ```bash
+> python create_embeddings.py --model biomedvlp --field text --overwrite
+> python create_embeddings.py --model biomedvlp --field text --sentence-level \
+>     --tag-suffix sent --overwrite
+> python analyze_similarity_threshold.py --tag biomedvlp_text
+> python analyze_similarity_threshold.py --tag biomedvlp_text_sent
+> ```
 
 Output file names:
 
@@ -112,6 +152,44 @@ python create_embeddings.py --model gemma_embed --field text
 python create_embeddings.py --list
 ```
 
+## 2b. Choosing an embedding source — `compare_embeddings.py`
+
+Selecting an embedding by training one Soft-CLIP model per variant is slow and
+confounded: each run adds optimisation noise, and the retrieval metric it
+produces is several causal steps away from the thing being compared.
+
+The soft targets use exactly one property of an embedding — *does it assign high
+similarity to reports that mean the same thing?* That is measurable directly, with
+no training, against ground truth already present in the data: reports whose text
+normalises to the same string are clinically equivalent by definition.
+
+```bash
+# Controlled — pooling held fixed, only the model varies
+python compare_embeddings.py --tags \
+    biomedvlp_text_mean bioclinicalbert_text_mean gemma_embed_text_native
+
+# Controlled — model held fixed, only pooling varies
+python compare_embeddings.py --tags \
+    biomedvlp_text_cls biomedvlp_text_mean biomedvlp_text_projection \
+    biomedvlp_text_projection_sent
+```
+
+Metric | Meaning
+---|---
+`pair_auroc` | P(a same-meaning pair scores above a different-meaning pair). **0.5 = no signal.**
+`p_at_1` | Fraction of anchors whose nearest neighbour means the same thing.
+`separation` | `mean(same) − mean(different)`, in cosine units.
+`bimodality` | Standardised separation (Cohen's *d*) — how distinct the two populations are.
+
+Every tag is scored on the **same subsampled rows** against the **same ground
+truth**, so the comparison is paired and training-free. Run the grid here, then
+train Soft-CLIP only with the winner (plus one loser, as a contrast worth
+reporting).
+
+If the best variant sits near `pair_auroc` 0.5, the soft targets are noise no
+matter which one you pick — and no `alpha` will fix that. That is a publishable
+finding on its own, and it costs no GPU time to establish.
+
 ## 3a. Hard baseline — `train_baseline.py`
 
 Fine-tunes CLIP with a study-level supervised contrastive loss (any
@@ -131,14 +209,23 @@ python train_baseline.py [--mode {train,eval,both}] [--checkpoint PATH]
 | `--mode` | `both` | `train`, `eval`, or `both`. |
 | `--checkpoint` | – | Required for `--mode eval`. Loaded with `from_pretrained`. |
 | `--text-field` | `text` | CLIP text input column. |
-| `--batch-size` | `256` | |
-| `--lr` | `5e-6` | |
+| `--batch-size` | `256` | From `mimic_clip.config.DEFAULT_BATCH_SIZE` — shared with soft-CLIP. |
+| `--lr` | `5e-6` | From `mimic_clip.config.DEFAULT_LR` — shared with soft-CLIP. |
 | `--weight-decay` | `0.2` | |
 | `--epochs` | `10` | |
-| `--patience` | `2` | Early stopping. |
-| `--run-name` | auto | Auto name encodes `{loss}_{field}` when omitted. |
+| `--patience` | `2` | Early stopping, on validation **hard** loss. |
+| `--seed` | `42` | Run ≥3 seeds and report mean ± std. |
+| `--run-name` | auto | Auto name encodes `{loss}_{field}` (plus `_s{seed}` if non-default). |
 
-Checkpoints go to `checkpoints/hard/{run_name}/`.
+Checkpoints go to `checkpoints/hard/{run_name}/`, together with a
+`run_config.json` recording exactly what the run was trained with.
+
+> **Optimisation defaults are shared between the two arms** via
+> `mimic_clip/config.py`. They previously differed (soft-CLIP defaulted to
+> batch 128 / lr 1e-6 against the baseline's 256 / 5e-6, and no run command
+> overrode them), which meant every soft-CLIP result was produced with half the
+> in-batch negatives and a 5× smaller step than the baseline it was compared
+> against. Change them in one place or not at all.
 
 Examples:
 
@@ -186,16 +273,53 @@ Flag | Default | Notes
 `--soft-temp` | `0.1` | Temperature for softmax over semantic similarities (top-K mode only).
 `--soft-top-k` | `None` | If set, only the K largest similarities per row form the soft target distribution (fixed-K neighbor ablation). Ignored if `--soft-threshold` is set.
 `--soft-threshold` | `None` | If set, keeps only pairs whose combined similarity exceeds this value, rescales as `(s - threshold)/(1 - threshold)`, and row-normalizes — a data-dependent (dynamic-K) alternative to `--soft-top-k`. Must be in `[-1, 1)`.
-`--text-similarity-weight` | `0.5` | Only used in threshold mode. Weight on text similarity when combining it with image similarity: `combined = w * text_sim + (1-w) * image_sim`. Set to `1.0` to threshold on text similarity alone.
-`--batch-size` | `128` |
-`--lr` | `1e-6` |
+`--text-similarity-weight` | `1.0` | Only used in threshold mode. Weight on text similarity when combining with image similarity: `combined = w * text_sim + (1-w) * image_sim`. Defaults to pure text — mixing in the model's own image similarity is self-reinforcing.
+`--calibrate-temp` | `None` | Solve for the temperature that puts this much target mass on the true pair (e.g. `0.5`) instead of using `--soft-temp` directly. See the note below.
+`--shuffle-embeddings` | off | **Control run.** Permutes the semantic embeddings so soft targets carry no image–text correspondence.
+`--batch-size` | `256` | Shared with the baseline via `mimic_clip.config`.
+`--lr` | `5e-6` | Shared with the baseline via `mimic_clip.config`.
 `--epochs` / `--patience` | `10` / `2` |
-`--run-name` | auto | Auto name encodes `loss_field_tag_alpha_temp[_k]`.
+`--seed` | `42` | Run ≥3 seeds and report mean ± std.
+`--early-stop-metric` | `hard` | Which validation quantity early stopping monitors. `hard` is defined identically for both arms, so checkpoints stay comparable across `alpha`. `total` restores the old behaviour of monitoring the blended loss.
+`--run-name` | auto | Auto name encodes `loss_field_tag_alpha_temp[_k][_thr][_cal][_shuffled][_seed]`.
 
 Startup validates that the resolved CSV and `.pt` files exist; missing files
 raise `FileNotFoundError` with the exact command to run.
 
-Checkpoints go to `checkpoints/soft/{run_name}/`.
+Checkpoints go to `checkpoints/soft/{run_name}/`, together with a
+`run_config.json` that evaluation reads back.
+
+### Three things worth knowing before sweeping `alpha`
+
+**1. `soft_temp` matters more than `alpha`, and `0.1` is close to the worst
+setting.** With L2-normalised embeddings the diagonal is exactly 1.0, so for a
+similarity distribution with mean ≈ 0.48 / std ≈ 0.19 at batch size 128:
+
+| `soft_temp` | mass the soft target puts on the true pair |
+|---|---|
+| 0.03 | 0.66 |
+| 0.05 | 0.50 |
+| **0.10** | **0.21** ← the original setting |
+| 0.20 | 0.06 |
+
+At 0.10 the true pair is barely preferred over an arbitrary other report, so
+sweeping `alpha` at that temperature really just sweeps *how much label
+corruption to apply*. `--calibrate-temp 0.5` fixes the smoothing to something
+interpretable so `alpha` means the same thing across embedding sources and batch
+sizes. Every run prints `diag_mass` per epoch — report it alongside your results.
+
+**2. `--alpha 0.0` is a strict control.** The hybrid loss reduces exactly to
+`study_level_contrastive_loss`, so an `alpha=0` run must reproduce
+`train_baseline.py` at the same seed, batch size and lr. If it doesn't, there's a
+pipeline bug and no soft-CLIP number is attributable. Include `alpha=0` as the
+left endpoint of the sweep, and sample the low end densely
+(`{0, 0.05, 0.1, 0.2, 0.35, 0.5}`) — an interior optimum at 0.1 is invisible on a
+`{0.3, 0.5, 0.7}` grid.
+
+**3. `--shuffle-embeddings` is the decisive experiment, and costs one run.**
+If the shuffled control scores the same as the real run, the soft targets carry
+no clinical information and any gain is generic label smoothing rather than
+semantics. Without it, a small win at low `alpha` cannot be attributed.
 
 Examples:
 
@@ -232,12 +356,33 @@ python train_soft_clip.py --mode eval --checkpoint checkpoints/soft/soft_biomedv
 
 ## Evaluation metrics
 
-Both training scripts use the same retrieval evaluation:
+Both training scripts use the same retrieval evaluation — Recall@1/5/10, Median
+Rank and MRR, in both directions — reported under **four groupings** of the same
+similarity matrix:
 
-- **Image → Text** and **Text → Image** at the study level
-- Recall@1, Recall@5, Recall@10
-- Median Rank
-- MRR (Mean Reciprocal Rank)
+Grouping | A retrieval counts as correct when… | Purpose
+---|---|---
+`exact` | the retrieved item shares the query's `study_id` | the original metric
+`clinical` | the retrieved report is a near-duplicate of the query's | clinical equivalence, no labels needed
+`exact_dedup` | `study_id` matches, against a pool with duplicate reports removed | removes the redundancy ceiling
+`subject` | the retrieved item shares the query's `subject_id` | nuisance probe: how much patient identity survives
+
+**Why `exact` alone is not enough.** MIMIC-CXR contains thousands of studies whose
+reports are verbatim identical ("No acute cardiopulmonary abnormality"). Under
+`exact`, retrieving one of those for another is scored as an error even though it
+is clinically correct. The only way to win on such pairs is to encode nuisance
+variation — anatomy, positioning, exposure — which is exactly what soft
+supervision is designed to suppress. So `exact` cannot distinguish "the soft
+targets are noise" from "the soft targets worked as intended".
+
+`clinical` groups are built by normalising report text (lowercase, strip
+punctuation, collapse whitespace) and matching exactly. Two studies whose reports
+normalise to the same string are clinically equivalent *by definition* — this is
+lexical ground truth, not a model output, so using it to score the models under
+comparison is not circular. It needs no CheXpert labels and no PhysioNet access.
+
+**The signature of a method that works as intended: `exact` down, `clinical` up,
+`subject` down.** Report all four; any one alone is uninterpretable.
 
 The implementation lives in
 [`mimic_clip/metrics.py`](mimic_clip/metrics.py) (`run_retrieval_eval`).

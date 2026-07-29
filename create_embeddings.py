@@ -29,6 +29,7 @@ accumulate side-by-side and existing files are never silently overwritten.
 import argparse
 import glob
 import os
+import re
 
 import pandas as pd
 import torch
@@ -86,6 +87,36 @@ def parse_args() -> argparse.Namespace:
         help="Tokenizer max sequence length.",
     )
     parser.add_argument(
+        "--pooling",
+        choices=("auto", "projection", "mean", "cls"),
+        default="auto",
+        help=(
+            "How to reduce token states to one vector. 'auto' picks "
+            "'projection' for biomedvlp and 'mean' otherwise. 'cls' reproduces "
+            "the original (incorrect) behaviour for comparison. Ignored for "
+            "gemma_embed, which pools internally."
+        ),
+    )
+    parser.add_argument(
+        "--sentence-level",
+        action="store_true",
+        help=(
+            "Embed each sentence of the report separately and average. CXR-BERT "
+            "is documented for SENTENCE embeddings (its reported inputs average "
+            "~58 tokens); a full findings+impression report is out of that "
+            "regime and gets truncated. Recommended for --field text."
+        ),
+    )
+    parser.add_argument(
+        "--tag-suffix",
+        default="",
+        help=(
+            "Appended to the output filename, e.g. --tag-suffix cls writes "
+            "train_biomedvlp_text_cls_embeddings.pt. Use it to keep old and new "
+            "pooling variants side by side."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Recompute and overwrite the output .pt file if it already exists.",
@@ -110,8 +141,130 @@ def _list_existing_embeddings() -> None:
         print(f"  {os.path.basename(path)}  ({size_mb:.1f} MB)")
 
 
-def _output_path(split: str, model_slug: str, field: str) -> str:
-    return os.path.join(BASE_DATA_DIR, f"{split}_{model_slug}_{field}_embeddings.pt")
+def build_tag(model_slug: str, field: str, pooling: str,
+              sentence_level: bool = False, tag_suffix: str = "") -> str:
+    """Embeddings tag. Pooling is ALWAYS encoded, deliberately.
+
+    If the filename did not record how the vectors were extracted, it would be
+    possible to compare e.g. `biomedvlp` under `projection` against
+    `bioclinicalbert` under `mean` and read the difference as a property of the
+    models. Putting pooling in the name makes that confound visible at the point
+    where the comparison is made.
+    """
+    parts = [model_slug, field, pooling]
+    if sentence_level:
+        parts.append("sent")
+    if tag_suffix:
+        parts.append(tag_suffix)
+    return "_".join(parts)
+
+
+def _output_path(split: str, tag: str) -> str:
+    return os.path.join(BASE_DATA_DIR, f"{split}_{tag}_embeddings.pt")
+
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.;])\s+|\n+")
+# Bare section headers ("FINDINGS:", "IMPRESSION:") carry no clinical content
+# but would otherwise be averaged in as if they were sentences, pulling every
+# report toward a shared, meaningless direction.
+_HEADER_ONLY = re.compile(r"^\s*(findings?|impressions?|comparison|indication|technique|history)\s*:?\s*$", re.I)
+
+
+def split_sentences(report: str) -> list:
+    """Split a report into content-bearing sentences."""
+    parts = []
+    for chunk in _SENTENCE_SPLIT.split(str(report)):
+        chunk = chunk.strip()
+        if not chunk or _HEADER_ONLY.match(chunk):
+            continue
+        # Drop fragments with no alphabetic content (stray punctuation, "___").
+        if not re.search(r"[a-zA-Z]{2,}", chunk):
+            continue
+        parts.append(chunk)
+    return parts
+
+
+def _embed_batch(model, tokenizer, texts, pooling, max_length, device) -> torch.Tensor:
+    """Encode a list of strings into one vector each, L2-normalised.
+
+    Raw ``last_hidden_state[:, 0, :]`` (the "cls" option) is the wrong
+    representation for both encoders used here, and it is what produced the
+    unimodal similarity distribution reported in the write-up:
+
+    * ``BiomedVLP-CXR-BERT-specialized`` ships a projection head trained
+      specifically to make CLS embeddings comparable. The model card's own usage
+      example calls ``get_projected_text_embeddings`` and then takes a plain dot
+      product -- the projected output is already normalised. The pre-projection
+      CLS vector is simply not the space the model learned similarity in.
+    * ``Bio_ClinicalBERT`` has no sentence-level objective at all. CLS from a
+      masked-LM-only BERT is anisotropic: every pair lands in a narrow
+      similarity band regardless of content.
+
+    A healthy clinical similarity matrix on MIMIC-CXR should be clearly BIMODAL
+    -- a dense cluster of near-identical normal studies plus a long tail of
+    distinct pathology. Check the histogram before tuning anything downstream.
+    """
+    encoded = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        add_special_tokens=True,
+    ).to(device)
+
+    if pooling == "projection":
+        # Documented API from the model card. It runs its own forward pass, so
+        # do NOT also call model(**encoded) -- that would double the compute.
+        if not hasattr(model, "get_projected_text_embeddings"):
+            raise AttributeError(
+                "This model has no `get_projected_text_embeddings`. It is "
+                "specific to CXR-BERT; use `--pooling mean` for other encoders."
+            )
+        embeddings = model.get_projected_text_embeddings(
+            input_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+        )
+    else:
+        outputs = model(**encoded)
+        if pooling == "cls":
+            embeddings = outputs.last_hidden_state[:, 0, :]
+        elif pooling == "mean":
+            mask = encoded["attention_mask"].unsqueeze(-1).to(
+                outputs.last_hidden_state.dtype
+            )
+            summed = (outputs.last_hidden_state * mask).sum(dim=1)
+            embeddings = summed / mask.sum(dim=1).clamp_min(1e-9)
+        else:
+            raise ValueError(f"Unknown pooling strategy: {pooling!r}")
+
+    # get_projected_text_embeddings already normalises; doing it again is a
+    # no-op and keeps every branch on the same footing.
+    return embeddings / embeddings.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+
+
+def _embed_report_by_sentence(
+    model, tokenizer, report, base_pooling, max_length, device
+) -> torch.Tensor:
+    """Embed each sentence separately and average.
+
+    CXR-BERT was trained and is documented for *sentence* embeddings ("extract
+    radiological sentence embeddings", and its reported token statistics average
+    ~58 tokens). A full MIMIC-CXR report -- findings plus impression -- is well
+    outside that regime, and truncating it to a fixed window silently discards
+    the tail. Averaging sentence embeddings keeps every input inside the length
+    the encoder was trained for and covers the whole report.
+    """
+    sentences = split_sentences(report) or [str(report).strip() or ""]
+    per_sentence = _embed_batch(
+        model, tokenizer, sentences, base_pooling, max_length, device
+    )
+    pooled = per_sentence.mean(dim=0, keepdim=True)
+    return pooled / pooled.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+
+
+def _default_pooling(model_slug: str) -> str:
+    return "projection" if model_slug == "biomedvlp" else "mean"
 
 
 def _resolve_text_column(df: pd.DataFrame, field: str) -> pd.Series:
@@ -135,8 +288,14 @@ def prepare_and_embed(
     max_length: int,
     overwrite: bool,
     device: torch.device,
+    pooling: str = "auto",
+    sentence_level: bool = False,
 ) -> None:
     print(f"\n--- Processing: {os.path.basename(csv_path)} ---")
+
+    if pooling == "auto":
+        pooling = _default_pooling(model_slug)
+    print(f"Pooling: {pooling}{'  (per sentence, then averaged)' if sentence_level else ''}")
 
     if os.path.exists(output_pt_path) and not overwrite:
         print(
@@ -188,26 +347,55 @@ def prepare_and_embed(
         all_embeddings = []
         print(f"Running {model_hf_id} inference...")
         with torch.no_grad():
-            for i in tqdm(range(0, len(texts), batch_size)):
-                batch_texts = texts[i : i + batch_size]
-                inputs = tokenizer(
-                    batch_texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=max_length,
-                ).to(device)
-
-                outputs = model(**inputs)
-                embeddings = outputs.last_hidden_state[:, 0, :]  # CLS token
-                embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
-                all_embeddings.append(embeddings.cpu())
+            if sentence_level:
+                for report in tqdm(texts):
+                    all_embeddings.append(
+                        _embed_report_by_sentence(
+                            model, tokenizer, report, pooling, max_length, device
+                        ).float().cpu()
+                    )
+            else:
+                for i in tqdm(range(0, len(texts), batch_size)):
+                    all_embeddings.append(
+                        _embed_batch(
+                            model,
+                            tokenizer,
+                            texts[i : i + batch_size],
+                            pooling,
+                            max_length,
+                            device,
+                        ).float().cpu()
+                    )
 
         final_embeddings = torch.cat(all_embeddings, dim=0)
 
     os.makedirs(os.path.dirname(output_pt_path), exist_ok=True)
     torch.save(final_embeddings, output_pt_path)
     print(f"Saved {final_embeddings.shape[0]} embeddings to: {output_pt_path}")
+    _report_similarity_shape(final_embeddings)
+
+
+def _report_similarity_shape(embeddings: torch.Tensor, sample: int = 2000) -> None:
+    """Print the off-diagonal similarity distribution as a sanity check.
+
+    A wide unimodal blob means the embeddings carry little usable structure and
+    the soft targets built from them will be close to noise. Bimodal is what a
+    working clinical similarity signal looks like on MIMIC-CXR.
+    """
+    n = embeddings.size(0)
+    if n < 2:
+        return
+    idx = torch.randperm(n)[: min(sample, n)]
+    sub = embeddings[idx].float()
+    sim = sub @ sub.t()
+    off = sim[~torch.eye(sub.size(0), dtype=torch.bool)]
+    print(
+        f"  off-diagonal cosine similarity: mean={off.mean():.4f} "
+        f"std={off.std():.4f} "
+        f"p50={off.median():.4f} "
+        f"p90={off.quantile(0.90):.4f} "
+        f"p99={off.quantile(0.99):.4f}"
+    )
 
 
 def main() -> None:
@@ -222,15 +410,40 @@ def main() -> None:
     field = args.field
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Model : {model_slug}  ({model_hf_id})")
-    print(f"Field : {field}")
-    print(f"Tag   : {model_slug}_{field}")
-    print(f"Device: {device}")
+    pooling = args.pooling
+    if pooling == "auto":
+        pooling = _default_pooling(model_slug)
+        print(
+            f"\n!! --pooling auto resolved to {pooling!r} for {model_slug}.\n"
+            f"   'auto' picks each model's NATIVE representation, which differs "
+            f"between models.\n"
+            f"   That is the right choice for 'which pipeline works best', but it "
+            f"CONFOUNDS\n"
+            f"   a model-vs-model comparison. For a controlled comparison pass the "
+            f"same\n"
+            f"   --pooling to every model (e.g. --pooling mean). See "
+            f"compare_embeddings.py.\n"
+        )
+
+    tag = build_tag(model_slug, field, pooling, args.sentence_level, args.tag_suffix)
+
+    print(f"Model    : {model_slug}  ({model_hf_id})")
+    print(f"Field    : {field}")
+    print(f"Pooling  : {pooling}{'  (per sentence)' if args.sentence_level else ''}")
+    print(f"Tag      : {tag}")
+    print(f"Device   : {device}")
+
+    if not args.overwrite:
+        print(
+            "\nNOTE: any .pt file generated before the pooling fix used raw CLS "
+            "and has a different filename now, so it will not be picked up. Pass "
+            "--overwrite if you are regenerating an existing tag."
+        )
 
     for split, csv_path in (("train", OUTPUT_TRAIN_CSV_PATH), ("val", OUTPUT_VAL_CSV_PATH)):
         prepare_and_embed(
             csv_path=csv_path,
-            output_pt_path=_output_path(split, model_slug, field),
+            output_pt_path=_output_path(split, tag),
             model_slug=model_slug,
             model_hf_id=model_hf_id,
             field=field,
@@ -238,10 +451,12 @@ def main() -> None:
             max_length=args.max_length,
             overwrite=args.overwrite,
             device=device,
+            pooling=pooling,
+            sentence_level=args.sentence_level,
         )
 
     print(
-        f"\nDone. Use --embeddings-tag {model_slug}_{field} "
+        f"\nDone. Use --embeddings-tag {tag} "
         f"in train_soft_clip.py to consume these files."
     )
 
