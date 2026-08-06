@@ -49,10 +49,20 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for subsampling.",
     )
     parser.add_argument(
+        "--tag",
+        type=str,
+        default="biomedvlp_text",
+        help=(
+            "Embeddings tag to analyze, i.e. {split}_{tag}_embeddings.pt. Use "
+            "this to compare pooling strategies, e.g. --tag biomedvlp_text "
+            "against --tag biomedvlp_text_cls."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=str,
-        default="similarity_histogram.png",
-        help="Path to save the histogram figure.",
+        default=None,
+        help="Path to save the histogram figure. Defaults to similarity_histogram_{tag}.png.",
     )
     return parser.parse_args()
 
@@ -61,16 +71,18 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
 
+    output_path = args.output or f"similarity_histogram_{args.tag}.png"
+
     embeddings_path = os.path.join(
-        BASE_DATA_DIR, f"{args.split}_biomedvlp_text_embeddings.pt"
+        BASE_DATA_DIR, f"{args.split}_{args.tag}_embeddings.pt"
     )
     if not os.path.exists(embeddings_path):
         raise FileNotFoundError(
             f"Could not find {embeddings_path}. "
-            f"Run create_embeddings.py --model biomedvlp --field text first."
+            f"Run create_embeddings.py with the matching --model / --field first."
         )
 
-    embeddings = torch.load(embeddings_path)
+    embeddings = torch.load(embeddings_path, weights_only=True)
     print(f"Loaded embeddings: {embeddings.shape} from {embeddings_path}")
 
     n = embeddings.size(0)
@@ -92,7 +104,7 @@ def main() -> None:
     off_diag_mask = ~torch.eye(n_rows, dtype=torch.bool)
     off_diag_values = similarity_matrix[off_diag_mask]
 
-    print(f"\n--- Off-diagonal cosine similarity stats ({args.split}, BiomedVLP, full text) ---")
+    print(f"\n--- Off-diagonal cosine similarity stats ({args.split}, {args.tag}) ---")
     print(f"count : {off_diag_values.numel():,}")
     print(f"mean  : {off_diag_values.mean().item():.4f}")
     print(f"std   : {off_diag_values.std().item():.4f}")
@@ -104,7 +116,7 @@ def main() -> None:
     # instead, which has no such limit.
     off_diag_np = off_diag_values.numpy()
 
-    percentiles = [50, 75, 90, 95, 97, 99, 99.5]
+    percentiles = [50, 75, 80, 83, 85, 87, 90, 95, 97, 99, 99.5]
     print("\nPercentiles (candidate threshold values):")
     for p in percentiles:
         val = float(np.percentile(off_diag_np, p))
@@ -117,18 +129,25 @@ def main() -> None:
     # Plot histogram
     plt.figure(figsize=(8, 5))
     plt.hist(off_diag_np, bins=100, color="#4C72B0", alpha=0.85)
-    for p in [90, 95, 99]:
+    for p in [80, 85, 87, 90, 95, 97]:
         val = float(np.percentile(off_diag_np, p))
         plt.axvline(val, linestyle="--", linewidth=1, label=f"p{p} = {val:.2f}")
     plt.xlabel("Cosine similarity (off-diagonal report pairs)")
     plt.ylabel("Count")
     plt.title(
-        f"BiomedVLP full-text report similarity distribution ({args.split} split)"
+        f"Report similarity distribution: {args.tag} ({args.split} split)"
     )
     plt.legend()
     plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"\nSaved histogram to {args.output}")
+    plt.savefig(output_path, dpi=150)
+    print(f"\nSaved histogram to {output_path}")
+    print(
+        "\nSanity check: a working clinical similarity signal on MIMIC-CXR should "
+        "look BIMODAL (a dense cluster of near-identical normal studies plus a "
+        "long tail of distinct pathology). A wide unimodal blob means the "
+        "embeddings carry little usable structure and the soft targets built "
+        "from them will be close to noise."
+    )
 
 
 if __name__ == "__main__":

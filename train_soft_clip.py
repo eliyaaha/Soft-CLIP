@@ -39,7 +39,16 @@ from mimic_clip import (
     run_retrieval_eval,
     soft_clip_hybrid_loss,
 )
-from mimic_clip.config import ALLOWED_TEXT_FIELDS
+from mimic_clip.config import (
+    ALLOWED_TEXT_FIELDS,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_EPOCHS,
+    DEFAULT_LR,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_PATIENCE,
+    DEFAULT_SEED,
+    DEFAULT_WEIGHT_DECAY,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,15 +97,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft-threshold", type=float,default=None,
                         help="Keep samples whose combined text-image similarity is at least this value.")
 
-    parser.add_argument("--text-similarity-weight", type=float, default=0.5,
-                        help="Weight of text similarity in threshold mode. Image similarity receives 1 minus this value.")
-    
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-6)
-    parser.add_argument("--weight-decay", type=float, default=0.2)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--patience", type=int, default=2)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--text-similarity-weight", type=float, default=1.0,
+                        help="Weight of text similarity in threshold mode. Image similarity receives "
+                             "1 minus this value. Defaults to 1.0 (pure text): mixing in the current "
+                             "model's own image similarity is self-reinforcing.")
+    parser.add_argument("--calibrate-temp", type=float, default=None,
+                        help="Instead of using --soft-temp directly, solve for the temperature that "
+                             "puts this much target mass on the true pair (e.g. 0.5). Makes alpha "
+                             "mean the same thing across embedding sources and batch sizes.")
+    parser.add_argument("--shuffle-embeddings", action="store_true",
+                        help="CONTROL: permute the semantic embeddings so the soft targets carry no "
+                             "image-text correspondence. If this scores the same as the real run, the "
+                             "soft targets contain no clinical signal and the effect is just generic "
+                             "label smoothing.")
+
+    # NOTE: these were previously 128 / 1e-6 here but 256 / 5e-6 in
+    # train_baseline.py, and no run command overrode them -- so every soft-CLIP
+    # result was produced with half the negatives and a 5x smaller step than the
+    # baseline it was compared against. Both scripts now import the same values.
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
+    parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--early-stop-metric", choices=("hard", "total"), default="hard",
+                        help="Which validation quantity early stopping monitors. 'hard' is defined "
+                             "identically for both arms, so checkpoints stay comparable across alpha.")
     parser.add_argument("--run-name", default=None)
     return parser.parse_args()
 
@@ -116,9 +144,13 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         soft_top_k=args.soft_top_k,
         soft_threshold=args.soft_threshold,
         text_similarity_weight=args.text_similarity_weight,
+        calibrate_temp=args.calibrate_temp,
+        shuffle_embeddings=args.shuffle_embeddings,
         embeddings_tag=args.embeddings_tag,
         train_embeddings_path=args.train_embeddings,
         val_embeddings_path=args.val_embeddings,
+        seed=args.seed,
+        early_stop_metric=args.early_stop_metric,
         run_name=args.run_name,
     )
     return config.finalize()
@@ -132,6 +164,9 @@ def make_soft_loss_fn(
     """Build a closure that picks the right embedding tensor by model.training."""
 
     def loss_fn(model, processor, batch, device):
+        # `indices` are positions in the UNFILTERED processed CSV, which is the
+        # order create_embeddings.py wrote the .pt tensors in. Rows dropped for
+        # missing images therefore do not shift this lookup.
         images, texts, study_ids, indices = batch
         semantic_source = train_embeddings if model.training else val_embeddings
         batch_semantic = semantic_source[indices].to(device)
@@ -150,6 +185,7 @@ def make_soft_loss_fn(
             soft_top_k=config.soft_top_k,
             soft_threshold=config.soft_threshold,
             text_similarity_weight=config.text_similarity_weight,
+            calibrate_temp=config.calibrate_temp,
         )
     return loss_fn
 
@@ -176,6 +212,29 @@ def main() -> None:
         val_embeddings = load_semantic_embeddings(config.val_embeddings_path)
         print(f"Loaded train embeddings: {tuple(train_embeddings.shape)}")
         print(f"Loaded val embeddings  : {tuple(val_embeddings.shape)}")
+
+        if config.shuffle_embeddings:
+            # CONTROL RUN. Permuting rows destroys the correspondence between an
+            # image-report pair and its semantic neighbours while preserving the
+            # similarity distribution exactly. If this matches the real run, the
+            # soft targets carry no clinical information and any gain is generic
+            # label smoothing rather than semantics.
+            generator = torch.Generator().manual_seed(config.seed)
+            train_embeddings = train_embeddings[
+                torch.randperm(train_embeddings.size(0), generator=generator)
+            ]
+            val_embeddings = val_embeddings[
+                torch.randperm(val_embeddings.size(0), generator=generator)
+            ]
+            print("!! SHUFFLE CONTROL ACTIVE: semantic embeddings permuted.")
+
+        if config.alpha == 0.0:
+            print(
+                "\n>> alpha=0: the soft term is switched off, so this run must "
+                "reproduce train_baseline.py exactly at the same seed, batch "
+                "size and lr. If it does not, there is a pipeline bug and no "
+                "soft-CLIP number is attributable.\n"
+            )
 
         fit(
             model=model,

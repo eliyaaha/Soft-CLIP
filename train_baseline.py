@@ -21,7 +21,16 @@ from mimic_clip import (
     run_retrieval_eval,
     study_level_contrastive_loss,
 )
-from mimic_clip.config import ALLOWED_TEXT_FIELDS
+from mimic_clip.config import (
+    ALLOWED_TEXT_FIELDS,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_EPOCHS,
+    DEFAULT_LR,
+    DEFAULT_NUM_WORKERS,
+    DEFAULT_PATIENCE,
+    DEFAULT_SEED,
+    DEFAULT_WEIGHT_DECAY,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,12 +56,17 @@ def parse_args() -> argparse.Namespace:
         default="text",
         help="Which text column from the processed CSV CLIP should see.",
     )
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--weight-decay", type=float, default=0.2)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--patience", type=int, default=2)
-    parser.add_argument("--num-workers", type=int, default=4)
+    # Shared with train_soft_clip.py via mimic_clip.config so the two arms
+    # cannot silently drift apart again.
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
+    parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                        help="Run at >= 3 seeds and report mean +/- std; small gaps "
+                             "between configurations are otherwise uninterpretable.")
     parser.add_argument("--run-name", default=None, help="Override auto-generated run name.")
     return parser.parse_args()
 
@@ -67,6 +81,7 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         epochs=args.epochs,
         patience=args.patience,
         num_workers=args.num_workers,
+        seed=args.seed,
         run_name=args.run_name,
     )
     return config.finalize()
@@ -78,9 +93,13 @@ def make_hard_loss_fn():
         image_features, text_features = clip_features(
             model, processor, images, texts, device
         )
-        return study_level_contrastive_loss(
+        loss = study_level_contrastive_loss(
             image_features, text_features, model.logit_scale, study_ids
         )
+        # Same (loss, components) contract as the soft loss. The "hard" entry is
+        # what early stopping monitors in both arms, which is what makes their
+        # checkpoints comparable.
+        return loss, {"hard": loss.detach()}
     return loss_fn
 
 
