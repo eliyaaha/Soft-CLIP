@@ -116,7 +116,7 @@ def main() -> None:
     # instead, which has no such limit.
     off_diag_np = off_diag_values.numpy()
 
-    percentiles = [50, 75, 90, 95, 97, 99, 99.5]
+    percentiles = [50, 75, 80, 83, 85, 87, 90, 95, 97, 99, 99.5]
     print("\nPercentiles (candidate threshold values):")
     for p in percentiles:
         val = float(np.percentile(off_diag_np, p))
@@ -129,7 +129,7 @@ def main() -> None:
     # Plot histogram
     plt.figure(figsize=(8, 5))
     plt.hist(off_diag_np, bins=100, color="#4C72B0", alpha=0.85)
-    for p in [90, 95, 99]:
+    for p in [80, 85, 87, 90, 95, 97]:
         val = float(np.percentile(off_diag_np, p))
         plt.axvline(val, linestyle="--", linewidth=1, label=f"p{p} = {val:.2f}")
     plt.xlabel("Cosine similarity (off-diagonal report pairs)")
